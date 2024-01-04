@@ -11,141 +11,115 @@
 )]
 #![deny(clippy::correctness)]
 
-use std::error::Error;
-use std::io::Write;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use midir::os::unix::VirtualOutput;
-use midir::{Ignore, MidiIO, MidiInput, MidiOutput};
-use parking_lot::Mutex;
+use bloop::{BloopCommand, UiState};
+use eframe::egui;
+use eyre::{eyre, Result};
+use midir::MidiInputConnection;
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum LoopState {
-    #[default]
-    Idle,
-    Recording(Instant),
-    Playing(Instant, Duration),
+#[macro_use]
+mod generic_vec;
+mod bloop;
+mod midi_in;
+mod midi_out;
+
+pub const FRAME_TIME: Duration = Duration::from_millis(5);
+pub const SLEEP_PRECISION: Duration = Duration::from_millis(100);
+pub const BUFFER_TIME: Duration = Duration::from_millis(50);
+
+fn main() -> Result<()> {
+    // Initialize logging.
+    env_logger::builder().init();
+
+    #[cfg(debug_assertions)]
+    color_eyre::install()?;
+
+    let native_options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "Bloop.rs",
+        native_options,
+        Box::new(|cc| Box::new(App::new(cc).unwrap())),
+    )
+    .map_err(|e| eyre!("{e}"))
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let mut midi_in = MidiInput::new("Bloop.rs Input")?;
-    midi_in.ignore(Ignore::None);
-    let midi_out = MidiOutput::new("Bloop.rs Output")?;
-
-    let in_port = select_port(&midi_in, "input")?;
-
-    println!("\nOpening connections");
-
-    let (tx, rx) = flume::bounded(1);
-    let (midi_out_tx, midi_out_rx) = flume::bounded::<Box<[u8]>>(20);
-
-    let loop_state: Arc<Mutex<LoopState>> = Arc::new(Mutex::new(LoopState::Idle));
-    let loop1_buffer: Arc<Mutex<Vec<(Duration, Box<[u8]>)>>> = Arc::new(Mutex::new(vec![]));
-
-    let mut conn_out = midi_out.create_virtual("Bloop.rs")?;
-
-    let loop_state_ref = Arc::clone(&loop_state);
-    let loop1_buffer_ref = Arc::clone(&loop1_buffer);
-    let midi_out_tx_ref = midi_out_tx.clone();
-    let _conn_in = midi_in.connect(
-        &in_port,
-        "blooprs-forward",
-        move |_stamp, message, ()| {
-            midi_out_tx_ref.send(message.into()).expect("channel error");
-            if let LoopState::Recording(start) = *loop_state_ref.lock() {
-                loop1_buffer_ref
-                    .lock()
-                    .push((Instant::now() - start, message.into()));
-            }
-        },
-        (),
-    )?;
-
-    let loop_state_ref = Arc::clone(&loop_state);
-    let loop1_buffer_ref = Arc::clone(&loop1_buffer);
-    let midi_out_tx_ref = midi_out_tx.clone();
-    std::thread::spawn(move || loop {
-        let () = rx.recv().expect("channel error");
-        let playing_loop_state = *loop_state_ref.lock();
-        if let LoopState::Playing(mut start, loop_duration) = playing_loop_state {
-            let buffer = loop1_buffer_ref.lock().clone();
-            'buffer_loop: loop {
-                for (offset, message) in &buffer {
-                    sleep_until(start + *offset);
-                    if *loop_state_ref.lock() != playing_loop_state {
-                        break 'buffer_loop;
-                    }
-                    midi_out_tx_ref
-                        .send(message.clone())
-                        .expect("error sending");
-                }
-                start += loop_duration;
-            }
-        }
-    });
-
-    std::thread::spawn(move || {
-        for message in midi_out_rx {
-            conn_out.send(&message).expect("midi output error");
-        }
-    });
-
-    std::thread::spawn(move || {});
-
-    ncurses::initscr();
-    loop {
-        match ncurses::getch().try_into() {
-            Ok(b'q') => break,
-            Ok(b' ') => {
-                let now = Instant::now();
-                let mut state = loop_state.lock();
-                *state = match *state {
-                    LoopState::Idle => {
-                        println!("Starting recording ...\r");
-                        LoopState::Recording(now)
-                    }
-                    LoopState::Recording(start) => {
-                        tx.send(()).expect("channel error");
-                        let loop_duration = now - start;
-                        println!("Recorded {loop_duration:?} loop. Now playing ...\r");
-                        LoopState::Playing(now, loop_duration)
-                    }
-                    LoopState::Playing(_, _) => {
-                        loop1_buffer.lock().clear();
-                        println!("Cleared loop.\r");
-                        LoopState::Idle
-                    }
-                }
-            }
-            _ => (),
-        }
-    }
-    ncurses::endwin();
-
-    Ok(())
+struct App {
+    bloop_commands_tx: flume::Sender<BloopCommand>,
+    _midi_input_connection: MidiInputConnection<()>,
+    ui_state_rx: flume::Receiver<UiState>,
 }
 
-fn select_port<T: MidiIO>(midi_io: &T, descr: &str) -> Result<T::Port, Box<dyn Error>> {
-    let midi_ports = midi_io.ports();
-    if let [port] = midi_ports.as_slice() {
-        return Ok(port.clone());
+impl App {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Result<Self> {
+        let (bloop_commands_tx, bloop_commands_rx) = flume::unbounded();
+        let _midi_input_connection =
+            crate::midi_in::spawn_midi_in_thread(bloop_commands_tx.clone())?;
+        let ui_state_rx = crate::bloop::spawn_bloops_thread(bloop_commands_rx)?;
+
+        let app = App {
+            bloop_commands_tx,
+            _midi_input_connection,
+            ui_state_rx,
+        };
+        app.send(BloopCommand::RefreshUi);
+        Ok(app)
     }
 
-    println!("Available {} ports:", descr);
-    for (i, p) in midi_ports.iter().enumerate() {
-        println!("{}: {}", i, midi_io.port_name(p)?);
+    fn send(&self, command: BloopCommand) {
+        if let Err(e) = self.bloop_commands_tx.send(command) {
+            log::error!("Error sending command: {e}");
+        }
     }
-    print!("Please select {} port: ", descr);
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let port = midi_ports
-        .get(input.trim().parse::<usize>()?)
-        .ok_or("Invalid port number")?;
-    Ok(port.clone())
 }
 
-fn sleep_until(wake_time: std::time::Instant) {
-    spin_sleep::sleep(wake_time - std::time::Instant::now());
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let Ok(state) = self.ui_state_rx.recv() else {
+                log::error!("Error fetching UI state");
+                ui.colored_label(egui::Color32::RED, "Error fetching UI state");
+                return;
+            };
+
+            ui.heading("Bloop.rs");
+            match state.duration {
+                Some(duration) => ui.label(format!("Loop duration: {duration:?}")),
+                None => ui.label(""),
+            };
+            for (i, bloop) in state.bloops.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let r = ui.selectable_label(bloop.is_active, format!("Bloop #{i}"));
+                    if r.clicked() {
+                        self.send(BloopCommand::ToggleActive(i));
+                    }
+
+                    match bloop.state {
+                        bloop::BloopState::Idle => {
+                            ui.label("Idle");
+                            if ui.button("Start recording").clicked() {
+                                self.send(BloopCommand::StartRecording(i));
+                            }
+                        }
+                        bloop::BloopState::Recording { start: _, end } => {
+                            ui.label("Recording ...");
+                            if end.is_none() {
+                                if ui.button("Stop recording").clicked() {
+                                    self.send(BloopCommand::StartPlaying(i));
+                                }
+                            }
+                        }
+                        bloop::BloopState::Playing { .. } => {
+                            ui.label("Playing");
+                            if ui.button("Clear").clicked() {
+                                self.send(BloopCommand::Clear(i));
+                            }
+                        }
+                    }
+                });
+            }
+
+            self.send(BloopCommand::RefreshUi);
+        });
+    }
 }
