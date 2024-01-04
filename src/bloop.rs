@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use eyre::Result;
@@ -15,13 +15,72 @@ pub struct TimedMidiMessage {
     pub message: MidiMessage,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct BloopPlayback {
+    /// Index into the recording buffer of the next event to play back.
+    index: usize,
+    /// Time offset compared to the recording of the buffer.
+    offset: Duration,
+    /// Duration after which to restart playback.
+    loop_duration: Option<Duration>,
+}
+impl BloopPlayback {
+    pub fn new_loop(duration: Duration) -> Self {
+        Self {
+            index: 0,
+            offset: duration,
+            loop_duration: Some(duration),
+        }
+    }
+    pub fn next(self) -> Option<Self> {
+        Some(Self {
+            index: 0,
+            offset: self.offset + self.loop_duration?,
+            loop_duration: self.loop_duration,
+        })
+    }
+}
+
+pub struct PressedKeys(HashMap<u7, usize>);
+impl PressedKeys {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+    pub fn drain(&mut self) -> impl IntoIterator<Item = u7> {
+        std::mem::take(&mut self.0).into_keys()
+    }
+    pub fn note_on(&mut self, key: u7) -> bool {
+        let multiplicity = self.0.entry(key).or_default();
+        *multiplicity += 1;
+        *multiplicity == 1
+    }
+    pub fn note_off(&mut self, key: u7) -> bool {
+        match self.0.get_mut(&key) {
+            Some(1) => {
+                self.0.remove(&key);
+                true
+            }
+            Some(multiplicity) => {
+                *multiplicity -= 1;
+                false
+            }
+            None => false,
+        }
+    }
+    pub fn contains(&self, key: u7) -> bool {
+        self.0.contains_key(&key)
+    }
+}
+
 pub struct Bloop {
     midi_out_tx: flume::Sender<LiveEvent<'static>>,
     config: BloopConfig,
 
-    pressed_keys: HashSet<u7>,
+    /// For each key: how many times has it been pressed. (Every note-on must
+    /// have a matching note-off before we send a note-off event.)
+    pressed_keys: PressedKeys,
     recording_buffer: VecDeque<TimedMidiMessage>,
-    playback_index: usize,
+    playbacks: Vec<BloopPlayback>,
 
     is_active: bool,
     state: BloopState,
@@ -33,9 +92,9 @@ impl Bloop {
             midi_out_tx,
             config: BloopConfig { output_channel },
 
-            pressed_keys: HashSet::new(),
+            pressed_keys: PressedKeys::new(),
             recording_buffer: VecDeque::new(),
-            playback_index: 0,
+            playbacks: vec![],
 
             is_active: false,
             state: BloopState::Idle,
@@ -54,9 +113,12 @@ impl Bloop {
         self.is_active = true;
     }
     pub fn deactivate(&mut self) {
+        self.clear_notes();
+        self.is_active = false;
+    }
+    pub fn clear_notes(&mut self) {
         if self.is_active {
-            self.is_active = false;
-            for key in std::mem::take(&mut self.pressed_keys) {
+            for key in self.pressed_keys.drain() {
                 let vel = u7::max_value();
                 self.send(MidiMessage::NoteOff { key, vel });
             }
@@ -70,14 +132,16 @@ impl Bloop {
     }
     pub fn start_recording(&mut self, start: Instant, end: Option<Instant>) {
         self.state = BloopState::Recording { start, end };
+        self.clear_old_recorded_messages();
     }
     pub fn start_playing(&mut self, duration: Duration) {
-        self.playback_index = 0;
-        let offset = duration;
-        self.state = BloopState::Playing { offset, duration };
+        self.playbacks.push(BloopPlayback::new_loop(duration));
+        self.state = BloopState::Playing;
     }
     pub fn clear(&mut self) {
+        self.clear_notes();
         self.recording_buffer.clear();
+        self.playbacks.clear();
         self.state = BloopState::Idle;
     }
 
@@ -93,7 +157,7 @@ impl Bloop {
     fn clear_old_recorded_messages(&mut self) {
         while let Some(message) = self.recording_buffer.front() {
             let start = self.recording_start().unwrap_or_else(Instant::now);
-            if message.time < start - crate::BUFFER_TIME {
+            if message.time < start - crate::LOOKBACK_TIME {
                 self.recording_buffer.pop_front();
             } else {
                 break;
@@ -104,16 +168,18 @@ impl Bloop {
     pub fn recv_midi(&mut self, message: TimedMidiMessage) {
         // Ignore if we never saw the corresponding `NoteOn` event.
         match message.message {
-            MidiMessage::NoteOff { key, .. } if !self.pressed_keys.remove(&key) => return,
-            MidiMessage::Aftertouch { key, .. } if !self.pressed_keys.contains(&key) => return,
+            MidiMessage::NoteOff { key, .. } if !self.pressed_keys.note_off(key) => return,
+            MidiMessage::Aftertouch { key, .. } if !self.pressed_keys.contains(key) => return,
             _ => (),
         }
 
         if self.is_active {
-            self.send(message.message);
             if let MidiMessage::NoteOn { key, vel: _ } = message.message {
-                self.pressed_keys.insert(key);
+                if !self.pressed_keys.note_on(key) && !crate::ALLOW_UNMATCHED_NOTE_ON {
+                    return;
+                }
             }
+            self.send(message.message);
         }
 
         match self.state {
@@ -133,48 +199,50 @@ impl Bloop {
             } => {
                 if end >= Instant::now() {
                     self.start_playing(end - start);
+                    None
                 } else {
-                    return Some(end);
+                    Some(end)
                 }
             }
 
-            BloopState::Playing {
-                mut offset,
-                duration,
-            } => loop {
-                let Some(message) = self.recording_buffer.get(self.playback_index) else {
-                    self.playback_index = 0;
-                    offset += duration;
-                    self.state = BloopState::Playing { offset, duration };
-                    continue;
-                };
-                if message.time + offset > Instant::now() {
-                    return Some(message.time + offset);
-                }
-                match message.message {
-                    MidiMessage::NoteOff { key, .. } => {
-                        if self.pressed_keys.remove(&key) {
-                            self.send(message.message);
+            BloopState::Playing => std::mem::take(&mut self.playbacks)
+                .into_iter()
+                .filter_map(|mut playback| {
+                    while let Some(message) = self.recording_buffer.get(playback.index) {
+                        if message.time + playback.offset > Instant::now() {
+                            self.playbacks.push(playback);
+                            return Some(message.time + playback.offset);
                         }
-                    }
-                    MidiMessage::NoteOn { key, .. } => {
-                        self.pressed_keys.insert(key);
-                        self.send(message.message);
-                    }
-                    MidiMessage::Aftertouch { key, .. } => {
-                        if self.pressed_keys.contains(&key) {
-                            self.send(message.message);
+                        if self.is_active {
+                            match message.message {
+                                MidiMessage::NoteOn { key, .. } => {
+                                    self.pressed_keys.note_on(key);
+                                    self.send(message.message);
+                                }
+                                MidiMessage::NoteOff { key, .. } => {
+                                    if self.pressed_keys.note_off(key) {
+                                        self.send(message.message);
+                                    }
+                                }
+                                MidiMessage::Aftertouch { key, .. } => {
+                                    if self.pressed_keys.contains(key) {
+                                        self.send(message.message);
+                                    }
+                                }
+                                _ => self.send(message.message),
+                            }
                         }
+                        if playback.index == 0 {
+                            self.playbacks.extend(playback.next());
+                        }
+                        playback.index += 1;
                     }
-                    _ => self.send(message.message),
-                }
-                self.playback_index += 1;
-            },
+                    None
+                })
+                .min(),
 
-            _ => (),
+            _ => None,
         }
-
-        None
     }
 
     fn ui_state(&self) -> BloopUiState {
@@ -213,10 +281,7 @@ pub enum BloopState {
         start: Instant,
         end: Option<Instant>,
     },
-    Playing {
-        offset: Duration,
-        duration: Duration,
-    },
+    Playing,
 }
 
 pub struct UiState {

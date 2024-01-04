@@ -26,17 +26,26 @@ mod bloop;
 mod midi_in;
 mod midi_out;
 
-pub const FRAME_TIME: Duration = Duration::from_millis(5);
+/// Precision of the OS that can be trusted.
 pub const SLEEP_PRECISION: Duration = Duration::from_millis(100);
-pub const BUFFER_TIME: Duration = Duration::from_millis(50);
+
+/// Time interval before starting a recording during which MIDI events are
+/// included in the recorded.
+pub const LOOKBACK_TIME: Duration = Duration::from_millis(100);
+
+/// Whether to send note-on events whenever a key is pressed, even if the
+/// corresponding note-off event might not be sent.
+pub const ALLOW_UNMATCHED_NOTE_ON: bool = true;
 
 fn main() -> Result<()> {
     // Initialize logging.
     env_logger::builder().init();
 
+    // Initialize panic handler.
     #[cfg(debug_assertions)]
     color_eyre::install()?;
 
+    // Run the GUI.
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Bloop.rs",
