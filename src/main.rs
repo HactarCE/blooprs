@@ -1,6 +1,8 @@
+//! Opinionated MIDI looper.
+
 #![warn(
     rust_2018_idioms,
-    // missing_docs,
+    missing_docs,
     clippy::if_then_some_else_none,
     clippy::manual_let_else,
     clippy::semicolon_if_nothing_returned,
