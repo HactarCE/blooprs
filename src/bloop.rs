@@ -3,11 +3,9 @@ use std::time::{Duration, Instant};
 
 use eyre::Result;
 use itertools::Itertools;
-use midly::{
-    live::LiveEvent,
-    num::{u4, u7},
-    MidiMessage,
-};
+use midly::live::LiveEvent;
+use midly::num::{u4, u7};
+use midly::MidiMessage;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct TimedMidiMessage {

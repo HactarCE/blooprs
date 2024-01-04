@@ -1,5 +1,6 @@
 use eyre::{eyre, Result};
-use midir::{os::unix::VirtualOutput, MidiOutput};
+use midir::os::unix::VirtualOutput;
+use midir::MidiOutput;
 use midly::live::LiveEvent;
 
 pub fn spawn_midi_out_thread() -> Result<flume::Sender<LiveEvent<'static>>> {
