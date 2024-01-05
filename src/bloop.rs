@@ -1,4 +1,3 @@
-use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use eyre::Result;
@@ -6,6 +5,9 @@ use itertools::Itertools;
 use midly::live::LiveEvent;
 use midly::num::{u4, u7};
 use midly::MidiMessage;
+
+use crate::key_effect::KeyEffect;
+use crate::key_tracker::{ChannelSet, KeySet, KeyStatus, PerKey};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct TimedMidiMessage {
@@ -15,73 +17,97 @@ pub struct TimedMidiMessage {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct BloopPlayback {
+    /// Keys currently pressed by this playback.
+    keys_pressed: KeySet,
     /// Index into the recording buffer of the next event to play back.
     index: usize,
     /// Time offset compared to the recording of the buffer.
     offset: Duration,
-    /// Duration after which to restart playback.
-    loop_duration: Option<Duration>,
 }
 impl BloopPlayback {
-    pub fn new_loop(duration: Duration) -> Self {
+    pub fn new(offset: Duration) -> Self {
         Self {
+            keys_pressed: KeySet::new(),
             index: 0,
-            offset: duration,
-            loop_duration: Some(duration),
+            offset,
         }
-    }
-    pub fn next(self) -> Option<Self> {
-        Some(Self {
-            index: 0,
-            offset: self.offset + self.loop_duration?,
-            loop_duration: self.loop_duration,
-        })
     }
 }
 
-pub struct PressedKeys(HashMap<u7, usize>);
-impl PressedKeys {
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct MidiPassThrough {
+    keys: PerKey<ChannelSet>,
+    is_listening: bool,
+}
+impl MidiPassThrough {
     pub fn new() -> Self {
-        Self(HashMap::new())
+        Self::default()
     }
-    pub fn drain(&mut self) -> impl IntoIterator<Item = u7> {
-        std::mem::take(&mut self.0).into_keys()
-    }
-    pub fn note_on(&mut self, key: u7) -> bool {
-        let multiplicity = self.0.entry(key).or_default();
-        *multiplicity += 1;
-        *multiplicity == 1
-    }
-    pub fn note_off(&mut self, key: u7) -> bool {
-        match self.0.get_mut(&key) {
-            Some(1) => {
-                self.0.remove(&key);
-                true
-            }
-            Some(multiplicity) => {
-                *multiplicity -= 1;
-                false
-            }
-            None => false,
+    pub fn with_listening(is_listening: bool) -> Self {
+        Self {
+            keys: PerKey::default(),
+            is_listening,
         }
     }
-    pub fn contains(&self, key: u7) -> bool {
-        self.0.contains_key(&key)
+    pub fn filter_midi(&mut self, channel: u4, message: MidiMessage) -> bool {
+        match KeyEffect::from(message) {
+            // Allow note-on events iff we're listening.
+            KeyEffect::Press { key, vel: _ } if self.is_listening => {
+                self.keys[key].set_on(channel);
+                true
+            }
+
+            // Allow note-off events only if the key is no longer held by the
+            // user.
+            KeyEffect::Release { key } => {
+                self.keys[key].set_off(channel);
+                !self.keys[key].any()
+            }
+
+            // Allow polyphonic aftertouch only if the key is held.
+            KeyEffect::Aftertouch { key } => self.keys[key].any(),
+
+            // Allow other events iff we're listening.
+            _ => self.is_listening,
+        }
     }
 }
 
 pub struct Bloop {
+    /// MIDI output channel.
     midi_out_tx: flume::Sender<LiveEvent<'static>>,
+    /// User configuration.
     config: BloopConfig,
 
-    /// For each key: how many times has it been pressed. (Every note-on must
-    /// have a matching note-off before we send a note-off event.)
-    pressed_keys: PressedKeys,
-    recording_buffer: VecDeque<TimedMidiMessage>,
-    playbacks: Vec<BloopPlayback>,
+    /// State of MIDI passthrough (MIDI input -> output).
+    passthru: MidiPassThrough,
+    /// State of MIDI recording (MIDI input -> loop buffer).
+    recorder: MidiPassThrough,
+    /// Whether playback should make sound (loop buffer -> output).
+    is_playback_active: bool,
 
-    is_active: bool,
-    state: BloopState,
+    /// Input and output keys state.
+    keys: PerKey<KeyStatus>,
+
+    /// Buffer of recorded MIDI messages.
+    recording_buffer: Vec<TimedMidiMessage>,
+
+    /// Keys held at the start of the recording, with their corresponding
+    /// velocities.
+    recording_start_state: Vec<(u7, u7)>,
+    /// Keys held at the end of the recording.
+    recording_end_state: KeySet,
+
+    /// Start time of recording. When recording or playing, this must be `Some`.
+    recording_start_time: Option<Instant>,
+    /// End time of recording. When recording, this may be `Some`. When playing,
+    /// this must be `Some`.
+    recording_end_time: Option<Instant>,
+
+    /// Playbacks in progress.
+    playbacks: Vec<BloopPlayback>,
+    /// Next playback offset.
+    next_queued_playback_time: Option<Instant>,
 }
 
 impl Bloop {
@@ -90,16 +116,44 @@ impl Bloop {
             midi_out_tx,
             config: BloopConfig { output_channel },
 
-            pressed_keys: PressedKeys::new(),
-            recording_buffer: VecDeque::new(),
-            playbacks: vec![],
+            passthru: MidiPassThrough::with_listening(true),
+            recorder: MidiPassThrough::new(),
+            is_playback_active: true,
 
-            is_active: false,
-            state: BloopState::Idle,
+            keys: PerKey::default(),
+
+            recording_buffer: vec![],
+            recording_start_state: vec![],
+            recording_end_state: KeySet::new(),
+            recording_start_time: None,
+            recording_end_time: None,
+
+            playbacks: vec![],
+            next_queued_playback_time: None,
         }
     }
 
+    /// Returns whether a key is held by the user or by any playback of the
+    /// loop.
+    fn is_key_held(&self, key: u7) -> bool {
+        self.keys[key].input.any()
+            || (self.is_playback_active
+                && self
+                    .playbacks
+                    .iter()
+                    .any(|playback| playback.keys_pressed.contains(key)))
+    }
+
+    /// Sends a MIDI message.
+    ///
+    /// Ignores note-off events for keys that should remain held.
     fn send(&self, message: MidiMessage) {
+        // If something else is keeping the key held, don't release it yet.
+        match KeyEffect::from(message) {
+            KeyEffect::Release { key, .. } if self.is_key_held(key) => return,
+            _ => (),
+        }
+
         let channel = self.config.output_channel;
         let event = LiveEvent::Midi { channel, message };
         if let Err(e) = self.midi_out_tx.send(event) {
@@ -107,146 +161,223 @@ impl Bloop {
         }
     }
 
-    pub fn activate(&mut self) {
-        self.is_active = true;
+    pub fn playback_keys_pressed(&self) -> KeySet {
+        self.playbacks
+            .iter()
+            .map(|playback| playback.keys_pressed)
+            .fold(KeySet::new(), |a, b| a | b)
     }
-    pub fn deactivate(&mut self) {
-        self.clear_notes();
-        self.is_active = false;
-    }
-    pub fn clear_notes(&mut self) {
-        if self.is_active {
-            for key in self.pressed_keys.drain() {
-                let vel = u7::max_value();
-                self.send(MidiMessage::NoteOff { key, vel });
-            }
+    pub fn release_keys(&self, keys_to_release: KeySet) {
+        for key in keys_to_release.iter_keys() {
+            self.send(MidiMessage::NoteOn { key, vel: 0.into() });
         }
     }
-    pub fn toggle_active(&mut self) {
-        match self.is_active {
-            true => self.deactivate(),
-            false => self.activate(),
+
+    /// Cancels all in-progress playbacks of the loop.
+    pub fn cancel_recording(&mut self) {
+        if self.recording_start_time.is_some() {
+            self.recording_start_time = None;
+            self.recording_end_time = None;
+            self.recorder.is_listening = false;
+        }
+    }
+    pub fn cancel_all_playbacks(&mut self) {
+        let keys_to_release = self.playback_keys_pressed();
+        self.playbacks.clear();
+        self.cancel_next_playback();
+        self.release_keys(keys_to_release);
+    }
+    pub fn cancel_next_playback(&mut self) {
+        self.next_queued_playback_time = None;
+    }
+    pub fn is_recording(&self) -> bool {
+        let now = Instant::now();
+        let past_start = self
+            .recording_start_time
+            .is_some_and(|start_time| start_time <= now);
+        let past_end = self
+            .recording_end_time
+            .is_some_and(|end_time| end_time <= now);
+        past_start && !past_end
+    }
+    pub fn toggle_listening(&mut self) {
+        self.passthru.is_listening = !self.passthru.is_listening;
+        if self.is_recording() {
+            self.recorder.is_listening = self.passthru.is_listening;
+        }
+    }
+    pub fn toggle_playing(&mut self) {
+        self.is_playback_active = !self.is_playback_active;
+        if self.is_playback_active {
+            // Press keys that should be held.
+            for key in self.playback_keys_pressed().iter_keys() {
+                // Is the user helding the key already?
+                if !self.keys[key].input.any() {
+                    // The user is not holding the key, so we should press it.
+                    let vel = self.keys[key].last_velocity;
+                    self.send(MidiMessage::NoteOn { key, vel });
+                }
+            }
+        } else {
+            // Release keys that should not be pressed.
+            self.release_keys(self.playback_keys_pressed());
         }
     }
     pub fn start_recording(&mut self, start: Instant, end: Option<Instant>) {
-        self.state = BloopState::Recording { start, end };
-        self.clear_old_recorded_messages();
+        self.recording_start_time = Some(start);
+        self.recording_end_time = end;
     }
     pub fn start_playing(&mut self, duration: Duration) {
-        self.playbacks.push(BloopPlayback::new_loop(duration));
-        self.state = BloopState::Playing;
-    }
-    pub fn clear(&mut self) {
-        self.clear_notes();
-        self.recording_buffer.clear();
-        self.playbacks.clear();
-        self.state = BloopState::Idle;
+        log::trace!("Start playing");
+
+        self.recorder.is_listening = false;
+
+        self.recording_end_state = self
+            .keys
+            .iter()
+            .map(|(_, status)| status.input.any())
+            .collect();
+
+        let Some(start_time) = self.recording_start_time else {
+            log::error!("cannot start playing with no start time");
+            return;
+        };
+        self.recording_end_time = Some(start_time + duration);
+
+        self.next_queued_playback_time = self.recording_end_time;
     }
 
-    pub fn is_recording(&self) -> bool {
-        matches!(self.state, BloopState::Recording { .. })
-    }
-    fn recording_start(&self) -> Option<Instant> {
-        match self.state {
-            BloopState::Recording { start, .. } => Some(start),
-            _ => None,
+    pub fn recv_midi(&mut self, channel: u4, event: TimedMidiMessage) {
+        if self.passthru.filter_midi(channel, event.message) {
+            match KeyEffect::from(event.message) {
+                KeyEffect::Press { key, vel } => {
+                    self.keys[key].input.set_on(channel);
+                    self.keys[key].last_velocity = vel;
+                }
+                KeyEffect::Release { key } => self.keys[key].input.set_off(channel),
+                KeyEffect::Aftertouch { .. } | KeyEffect::None => (),
+            }
+            self.send(event.message);
+        }
+
+        if self.recorder.filter_midi(channel, event.message) {
+            match KeyEffect::from(event.message) {
+                KeyEffect::Press { key, vel } => {
+                    self.keys[key].recording.set_on(channel);
+                    self.keys[key].last_velocity = vel;
+                }
+                KeyEffect::Release { key } => self.keys[key].recording.set_off(channel),
+                KeyEffect::Aftertouch { .. } | KeyEffect::None => (),
+            }
+            self.recording_buffer.push(event);
         }
     }
-    fn clear_old_recorded_messages(&mut self) {
-        while let Some(message) = self.recording_buffer.front() {
-            let start = self.recording_start().unwrap_or_else(Instant::now);
-            if message.time < start - crate::LOOKBACK_TIME {
-                self.recording_buffer.pop_front();
+
+    pub fn do_events_and_return_wake_time(&mut self, now: Instant) -> Option<Instant> {
+        let start_time = self.recording_start_time?;
+
+        if now <= start_time {
+            // We are not ready to start recording.
+            return Some(start_time);
+        }
+
+        if self.is_recording() && !self.recorder.is_listening {
+            // Start recording!
+            log::trace!("Start recording");
+            self.recorder.is_listening = self.passthru.is_listening;
+            self.recording_buffer.clear();
+            self.recording_start_state = self
+                .keys
+                .iter()
+                .filter(|(_, status)| status.input.any())
+                .map(|(i, status)| (i, status.last_velocity))
+                .collect_vec();
+        }
+
+        let end_time = self.recording_end_time?;
+        let loop_duration = end_time - start_time;
+
+        if self.recorder.is_listening {
+            if now <= end_time {
+                // We are not ready to stop recording. Keep recording.
+                return Some(end_time);
             } else {
-                break;
+                // Stop recording and start playing!
+                self.start_playing(loop_duration);
             }
         }
-    }
 
-    pub fn recv_midi(&mut self, message: TimedMidiMessage) {
-        // Ignore if we never saw the corresponding `NoteOn` event.
-        match message.message {
-            MidiMessage::NoteOff { key, .. } if !self.pressed_keys.note_off(key) => return,
-            MidiMessage::Aftertouch { key, .. } if !self.pressed_keys.contains(key) => return,
-            _ => (),
-        }
+        if let Some(queued_playback_time) = self.next_queued_playback_time {
+            if queued_playback_time <= now {
+                log::trace!("Starting new playback");
+                self.next_queued_playback_time = None;
 
-        if self.is_active {
-            if let MidiMessage::NoteOn { key, vel: _ } = message.message {
-                if !self.pressed_keys.note_on(key) && !crate::ALLOW_UNMATCHED_NOTE_ON {
-                    return;
-                }
-            }
-            self.send(message.message);
-        }
+                // Catch up to the present, to avoid duplicate note-on events.
+                self.do_events_and_return_wake_time(queued_playback_time);
 
-        match self.state {
-            BloopState::Idle | BloopState::Recording { .. } => {
-                self.clear_old_recorded_messages();
-                self.recording_buffer.push_back(message);
-            }
-            BloopState::Playing { .. } => (),
-        }
-    }
-
-    pub fn do_events_and_get_next_event_time(&mut self) -> Option<Instant> {
-        match self.state {
-            BloopState::Recording {
-                start,
-                end: Some(end),
-            } => {
-                if end >= Instant::now() {
-                    self.start_playing(end - start);
-                    None
-                } else {
-                    Some(end)
-                }
-            }
-
-            BloopState::Playing => std::mem::take(&mut self.playbacks)
-                .into_iter()
-                .filter_map(|mut playback| {
-                    while let Some(message) = self.recording_buffer.get(playback.index) {
-                        if message.time + playback.offset > Instant::now() {
-                            self.playbacks.push(playback);
-                            return Some(message.time + playback.offset);
-                        }
-                        if self.is_active {
-                            match message.message {
-                                MidiMessage::NoteOn { key, .. } => {
-                                    self.pressed_keys.note_on(key);
-                                    self.send(message.message);
-                                }
-                                MidiMessage::NoteOff { key, .. } => {
-                                    if self.pressed_keys.note_off(key) {
-                                        self.send(message.message);
-                                    }
-                                }
-                                MidiMessage::Aftertouch { key, .. } => {
-                                    if self.pressed_keys.contains(key) {
-                                        self.send(message.message);
-                                    }
-                                }
-                                _ => self.send(message.message),
-                            }
-                        }
-                        if playback.index == 0 {
-                            self.playbacks.extend(playback.next());
-                        }
-                        playback.index += 1;
+                // Press any notes that should be pressed at the start of
+                // playback and aren't already.
+                let mut playback = BloopPlayback::new(queued_playback_time - start_time);
+                for &(key, vel) in &self.recording_start_state {
+                    playback.keys_pressed.insert(key);
+                    if self.is_playback_active {
+                        self.send(MidiMessage::NoteOn { key, vel });
                     }
-                    None
-                })
-                .min(),
+                }
+                // Start the playback.
+                self.playbacks.push(playback);
 
-            _ => None,
+                // Queue the next playback.
+                log::trace!("Queueing next playback");
+                self.next_queued_playback_time = Some(queued_playback_time + loop_duration);
+            }
         }
+
+        let mut wake_time = self.next_queued_playback_time;
+        let mut queued_events = vec![];
+
+        self.playbacks.retain_mut(|playback| {
+            while let Some(event) = self.recording_buffer.get(playback.index) {
+                if event.time + playback.offset > now {
+                    // Wake at the next event.
+                    wake_time = Some(option_at_most(wake_time, event.time + playback.offset));
+                    // Keep this playback.
+                    return true;
+                }
+
+                // Simulate this event.
+                playback.keys_pressed.update(event.message);
+                if let KeyEffect::Press { key, vel } = event.message.into() {
+                    self.keys[key].last_velocity = vel;
+                }
+                // Send this event.
+                if self.is_playback_active {
+                    queued_events.push(event);
+                }
+
+                // Play the next event.
+                playback.index += 1;
+            }
+            false // End this playback.
+        });
+
+        queued_events.sort_by_key(|event| event.time);
+        for event in queued_events {
+            self.send(event.message);
+        }
+
+        wake_time
     }
 
     fn ui_state(&self) -> BloopUiState {
         BloopUiState {
-            is_active: self.is_active,
-            state: self.state,
+            is_listening: self.passthru.is_listening,
+            is_waiting_to_record: self
+                .recording_start_time
+                .is_some_and(|start_time| start_time > Instant::now()),
+            is_recording: self.is_recording(),
+            is_playing_back: !self.playbacks.is_empty() || self.next_queued_playback_time.is_some(),
+            is_playback_active: self.is_playback_active,
         }
     }
 }
@@ -260,26 +391,17 @@ pub enum BloopCommand {
 
     Midi(LiveEvent<'static>),
 
-    ToggleActive(usize),
+    ToggleListening(usize),
+    TogglePlayback(usize),
+    CancelPlaying(usize),
     StartRecording(usize),
     StartPlaying(usize),
-    Clear(usize),
+    ClearAll,
 }
 impl From<LiveEvent<'static>> for BloopCommand {
     fn from(value: LiveEvent<'static>) -> Self {
         BloopCommand::Midi(value)
     }
-}
-
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
-pub enum BloopState {
-    #[default]
-    Idle,
-    Recording {
-        start: Instant,
-        end: Option<Instant>,
-    },
-    Playing,
 }
 
 pub struct UiState {
@@ -289,8 +411,11 @@ pub struct UiState {
 }
 
 pub struct BloopUiState {
-    pub is_active: bool,
-    pub state: BloopState,
+    pub is_listening: bool,
+    pub is_waiting_to_record: bool,
+    pub is_recording: bool,
+    pub is_playing_back: bool,
+    pub is_playback_active: bool,
 }
 
 pub fn spawn_bloops_thread(
@@ -311,7 +436,7 @@ pub fn spawn_bloops_thread(
         loop {
             let next_event_time = bloops
                 .iter_mut()
-                .filter_map(|b| b.do_events_and_get_next_event_time())
+                .filter_map(|b| b.do_events_and_return_wake_time(Instant::now()))
                 .min();
 
             let command = if let Some(deadline) = next_event_time {
@@ -339,60 +464,63 @@ pub fn spawn_bloops_thread(
                     }
                 }
 
-                BloopCommand::Midi(LiveEvent::Midi {
-                    channel: _,
-                    message,
-                }) => {
+                BloopCommand::Midi(LiveEvent::Midi { channel, message }) => {
                     let time = Instant::now();
                     let message = TimedMidiMessage { time, message };
                     for bloop in &mut bloops {
-                        bloop.recv_midi(message.clone());
+                        bloop.recv_midi(channel, message);
                     }
                 }
                 BloopCommand::Midi(_) => (), // Ignore other MIDI events
 
-                BloopCommand::ToggleActive(i) => bloops[i].toggle_active(),
+                BloopCommand::ToggleListening(i) => bloops[i].toggle_listening(),
+                BloopCommand::TogglePlayback(i) => bloops[i].toggle_playing(),
+                BloopCommand::CancelPlaying(i) => bloops[i].cancel_all_playbacks(),
                 BloopCommand::StartRecording(i) => {
                     if epoch.is_none() || duration.is_none() {
+                        // If we don't know the tempo, then stop recording on
+                        // another bloop and use that to infer the tempo.
                         if let Some(recording_bloop) =
-                            bloops.iter_mut().find(|bloop| bloop.is_recording())
+                            bloops.iter_mut().find(|bloop| bloop.recorder.is_listening)
                         {
-                            let start = match recording_bloop.state {
-                                BloopState::Recording { start, .. } => start,
-                                _ => unreachable!(),
-                            };
-                            let end = Instant::now();
-                            recording_bloop.start_playing(end - start);
-                            epoch = Some(start);
-                            duration = Some(end - start);
+                            if let Some(start) = recording_bloop.recording_start_time {
+                                let end = Instant::now();
+                                epoch = Some(start);
+                                duration = Some(end - start);
+                                recording_bloop.start_playing(end - start);
+                            }
                         }
                     }
 
                     if let Some((next_start, next_end)) = next_loop_time(epoch, duration) {
+                        log::trace!(
+                            "Schedule recording start on #{i} in {:?}",
+                            next_start - Instant::now(),
+                        );
                         bloops[i].start_recording(next_start, Some(next_end));
                     } else {
+                        log::trace!("Schedule recording start on #{i}");
                         bloops[i].start_recording(Instant::now(), None);
                     }
                 }
                 BloopCommand::StartPlaying(i) => {
                     if epoch.is_some() || duration.is_some() {
-                        continue; // ignore
+                        continue; // We already know the tempo, so ignore this request.
                     }
-                    let start = match bloops[i].state {
-                        BloopState::Recording { start, .. } => start,
-                        _ => continue, // ignore
-                    };
-                    let end = Instant::now();
-                    bloops[i].start_playing(end - start);
-                    epoch = Some(start);
-                    duration = Some(end - start);
+                    if let Some(start) = bloops[i].recording_start_time {
+                        let end = Instant::now();
+                        epoch = Some(start);
+                        duration = Some(end - start);
+                        bloops[i].start_playing(end - start);
+                    }
                 }
-                BloopCommand::Clear(i) => {
-                    bloops[i].clear();
-                    if bloops.iter().all(|bloop| bloop.state == BloopState::Idle) {
-                        epoch = None;
-                        duration = None;
+                BloopCommand::ClearAll => {
+                    for bloop in &mut bloops {
+                        bloop.cancel_recording();
+                        bloop.cancel_all_playbacks();
                     }
+                    epoch = None;
+                    duration = None;
                 }
             }
         }
@@ -409,4 +537,11 @@ fn next_loop_time(
     let next_start = epoch? + duration? * loops_elapsed.ceil() as u32;
     let next_end = next_start + duration?;
     Some((next_start, next_end))
+}
+
+pub fn option_at_most<T: PartialOrd>(a: Option<T>, b: T) -> T {
+    match a {
+        Some(a) if a < b => a,
+        _ => b,
+    }
 }

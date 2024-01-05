@@ -23,15 +23,13 @@ use midir::MidiInputConnection;
 #[macro_use]
 mod generic_vec;
 mod bloop;
+mod key_effect;
+mod key_tracker;
 mod midi_in;
 mod midi_out;
 
 /// Precision of the OS that can be trusted.
 pub const SLEEP_PRECISION: Duration = Duration::from_millis(100);
-
-/// Time interval before starting a recording during which MIDI events are
-/// included in the recorded.
-pub const LOOKBACK_TIME: Duration = Duration::from_millis(100);
 
 /// Whether to send note-on events whenever a key is pressed, even if the
 /// corresponding note-off event might not be sent.
@@ -82,10 +80,29 @@ impl App {
             log::error!("Error sending command: {e}");
         }
     }
+
+    fn do_bloop_key(&self, mods: egui::Modifiers, i: usize, state: &UiState) {
+        if let Some(bloop_state) = state.bloops.get(i) {
+            if mods.shift {
+                self.send(BloopCommand::ToggleListening(i));
+            } else {
+                if bloop_state.is_recording {
+                    self.send(BloopCommand::StartPlaying(i));
+                } else if bloop_state.is_playing_back {
+                    self.send(BloopCommand::TogglePlayback(i));
+                } else {
+                    self.send(BloopCommand::StartRecording(i));
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Always refresh the UI.
+        ctx.request_repaint();
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let Ok(state) = self.ui_state_rx.recv() else {
                 log::error!("Error fetching UI state");
@@ -94,41 +111,82 @@ impl eframe::App for App {
             };
 
             ui.heading("Bloop.rs");
-            match state.duration {
-                Some(duration) => ui.label(format!("Loop duration: {duration:?}")),
-                None => ui.label(""),
-            };
+            ui.horizontal(|ui| {
+                ui.allocate_space(egui::Vec2::new(0.0, 30.0));
+                if let Some(duration) = state.duration {
+                    if ui.small_button("Clear").clicked() {
+                        self.send(BloopCommand::ClearAll);
+                    }
+                    ui.label(format!("Loop duration: {duration:?}"));
+                }
+            });
             for (i, bloop) in state.bloops.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    let r = ui.selectable_label(bloop.is_active, format!("Bloop #{i}"));
+                    ui.label(format!("Bloop #{i}"));
+
+                    let r = ui.selectable_label(bloop.is_listening, "Listen");
                     if r.clicked() {
-                        self.send(BloopCommand::ToggleActive(i));
+                        self.send(BloopCommand::ToggleListening(i));
                     }
 
-                    match bloop.state {
-                        bloop::BloopState::Idle => {
-                            ui.label("Idle");
-                            if ui.button("Start recording").clicked() {
-                                self.send(BloopCommand::StartRecording(i));
+                    let r = ui.selectable_label(bloop.is_playback_active, "Playback");
+                    if r.clicked() {
+                        self.send(BloopCommand::TogglePlayback(i));
+                    }
+
+                    if bloop.is_waiting_to_record {
+                        ui.label("Waiting until start of loop ...");
+                    } else if bloop.is_recording {
+                        ui.label("Recording ...");
+                        if state.duration.is_none() {
+                            if ui.button("Stop recording").clicked() {
+                                self.send(BloopCommand::StartPlaying(i));
                             }
                         }
-                        bloop::BloopState::Recording { start: _, end } => {
-                            ui.label("Recording ...");
-                            if end.is_none() {
-                                if ui.button("Stop recording").clicked() {
-                                    self.send(BloopCommand::StartPlaying(i));
-                                }
-                            }
+                    } else if bloop.is_playing_back {
+                        ui.label("Playing");
+                        if ui.button("Cancel playback").clicked() {
+                            self.send(BloopCommand::CancelPlaying(i));
                         }
-                        bloop::BloopState::Playing { .. } => {
-                            ui.label("Playing");
-                            if ui.button("Clear").clicked() {
-                                self.send(BloopCommand::Clear(i));
-                            }
+                    } else {
+                        ui.label("Idle");
+                        if ui.button("Record").clicked() {
+                            self.send(BloopCommand::StartRecording(i));
                         }
                     }
                 });
             }
+
+            ui.input(|input| {
+                if input.key_pressed(egui::Key::Num1) {
+                    self.do_bloop_key(input.modifiers, 0, &state);
+                }
+                if input.key_pressed(egui::Key::Num2) {
+                    self.do_bloop_key(input.modifiers, 1, &state);
+                }
+                if input.key_pressed(egui::Key::Num3) {
+                    self.do_bloop_key(input.modifiers, 2, &state);
+                }
+                if input.key_pressed(egui::Key::Num4) {
+                    self.do_bloop_key(input.modifiers, 3, &state);
+                }
+                if input.key_pressed(egui::Key::Num5) {
+                    self.do_bloop_key(input.modifiers, 4, &state);
+                }
+                if input.key_pressed(egui::Key::Num6) {
+                    self.do_bloop_key(input.modifiers, 5, &state);
+                }
+                if input.key_pressed(egui::Key::Num7) {
+                    self.do_bloop_key(input.modifiers, 6, &state);
+                }
+                if input.key_pressed(egui::Key::Num8) {
+                    self.do_bloop_key(input.modifiers, 7, &state);
+                }
+
+                if input.key_pressed(egui::Key::Escape) {
+                    self.send(BloopCommand::ClearAll);
+                }
+            });
 
             self.send(BloopCommand::RefreshUi);
         });
