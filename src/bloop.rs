@@ -391,6 +391,7 @@ pub enum BloopCommand {
 
     Midi(LiveEvent<'static>),
 
+    DoKey(usize),
     ToggleListening(usize),
     TogglePlayback(usize),
     CancelPlaying(usize),
@@ -419,6 +420,7 @@ pub struct BloopUiState {
 }
 
 pub fn spawn_bloops_thread(
+    commands_tx: flume::Sender<BloopCommand>,
     commands_rx: flume::Receiver<BloopCommand>,
 ) -> Result<flume::Receiver<UiState>> {
     let midi_out_tx = crate::midi_out::spawn_midi_out_thread()?;
@@ -467,12 +469,40 @@ pub fn spawn_bloops_thread(
                 BloopCommand::Midi(LiveEvent::Midi { channel, message }) => {
                     let time = Instant::now();
                     let message = TimedMidiMessage { time, message };
-                    for bloop in &mut bloops {
-                        bloop.recv_midi(channel, message);
+                    if let KeyEffect::Press { key, vel: _ } = KeyEffect::from(message.message) {
+                        match (channel.as_int(), key.as_int()) {
+                            (4, 76) => commands_tx.send(BloopCommand::ClearAll).unwrap(),
+                            (5, 77) => commands_tx.send(BloopCommand::DoKey(0)).unwrap(),
+                            (4, 78) => bloops[0].toggle_listening(),
+                            (5, 79) => commands_tx.send(BloopCommand::DoKey(1)).unwrap(),
+                            (4, 80) => bloops[1].toggle_listening(),
+                            (5, 81) => commands_tx.send(BloopCommand::DoKey(2)).unwrap(),
+                            (4, 82) => bloops[2].toggle_listening(),
+                            _ => {
+                                for bloop in &mut bloops {
+                                    bloop.recv_midi(channel, message);
+                                }
+                            }
+                        }
+                    } else {
+                        for bloop in &mut bloops {
+                            bloop.recv_midi(channel, message);
+                        }
                     }
                 }
                 BloopCommand::Midi(_) => (), // Ignore other MIDI events
 
+                BloopCommand::DoKey(i) => {
+                    if bloops[i].is_recording() {
+                        commands_tx.send(BloopCommand::StartPlaying(i)).unwrap();
+                    } else if !bloops[i].playbacks.is_empty()
+                        || bloops[i].next_queued_playback_time.is_some()
+                    {
+                        commands_tx.send(BloopCommand::TogglePlayback(i)).unwrap();
+                    } else {
+                        commands_tx.send(BloopCommand::StartRecording(i)).unwrap();
+                    }
+                }
                 BloopCommand::ToggleListening(i) => bloops[i].toggle_listening(),
                 BloopCommand::TogglePlayback(i) => bloops[i].toggle_playing(),
                 BloopCommand::CancelPlaying(i) => bloops[i].cancel_all_playbacks(),

@@ -64,7 +64,8 @@ impl App {
         let (bloop_commands_tx, bloop_commands_rx) = flume::unbounded();
         let _midi_input_connection =
             crate::midi_in::spawn_midi_in_thread(bloop_commands_tx.clone())?;
-        let ui_state_rx = crate::bloop::spawn_bloops_thread(bloop_commands_rx)?;
+        let ui_state_rx =
+            crate::bloop::spawn_bloops_thread(bloop_commands_tx.clone(), bloop_commands_rx)?;
 
         let app = App {
             bloop_commands_tx,
@@ -86,13 +87,7 @@ impl App {
             if mods.shift {
                 self.send(BloopCommand::ToggleListening(i));
             } else {
-                if bloop_state.is_recording {
-                    self.send(BloopCommand::StartPlaying(i));
-                } else if bloop_state.is_playing_back {
-                    self.send(BloopCommand::TogglePlayback(i));
-                } else {
-                    self.send(BloopCommand::StartRecording(i));
-                }
+                self.send(BloopCommand::DoKey(i));
             }
         }
     }
