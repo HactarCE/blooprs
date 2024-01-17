@@ -7,6 +7,7 @@ use crate::bloop::BloopCommand;
 
 pub fn spawn_midi_in_thread(
     bloop_command_tx: flume::Sender<BloopCommand>,
+    in_port: &MidiInput,
 ) -> Result<MidiInputConnection<()>> {
     let mut midi_in = MidiInput::new("Bloop.rs Input")?;
     midi_in.ignore(Ignore::All);
