@@ -6,6 +6,25 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[workspace.lints.rust]
+missing_docs = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+cargo = "warn"
+doc_markdown = "warn"
+if_then_some_else_none = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+semicolon_inside_block = "warn"
+too_many_lines = "warn"
+undocumented_unsafe_blocks = "warn"
+unwrap_used = "warn"
+
+correctness = "deny"
+
+multiple_crate_versions = { level = "allow", priority = 1 }
+
 [dependencies]
 color-eyre = "0.6.2"
 eframe = "0.24.1"
