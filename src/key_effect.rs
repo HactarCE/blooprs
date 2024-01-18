@@ -1,4 +1,5 @@
-use midly::{num::u7, MidiMessage};
+use midly::num::u7;
+use midly::MidiMessage;
 
 pub enum KeyEffect {
     Press { key: u7, vel: u7 },

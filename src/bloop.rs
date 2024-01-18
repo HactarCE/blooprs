@@ -75,7 +75,7 @@ impl MidiPassThrough {
 
 pub struct Bloop {
     /// MIDI output channel.
-    midi_out_tx: Option<flume::Sender<LiveEvent<'static>>>,
+    midi_out_tx: flume::Sender<LiveEvent<'static>>,
     /// User configuration.
     config: BloopConfig,
 
@@ -111,9 +111,9 @@ pub struct Bloop {
 }
 
 impl Bloop {
-    pub fn new(output_channel: u4) -> Self {
+    pub fn new(midi_out_tx: flume::Sender<LiveEvent<'static>>, output_channel: u4) -> Self {
         Self {
-            midi_out_tx: None,
+            midi_out_tx,
             config: BloopConfig { output_channel },
 
             passthru: MidiPassThrough::with_listening(true),
@@ -156,10 +156,8 @@ impl Bloop {
 
         let channel = self.config.output_channel;
         let event = LiveEvent::Midi { channel, message };
-        if let Some(midi_out_tx) = &self.midi_out_tx {
-            if let Err(e) = midi_out_tx.send(event) {
-                log::error!("Error sending MIDI event: {e}");
-            }
+        if let Err(e) = self.midi_out_tx.send(event) {
+            log::error!("Error sending MIDI event: {e}");
         }
     }
 
@@ -388,9 +386,9 @@ pub struct BloopConfig {
     output_channel: u4,
 }
 
+#[derive(Debug, Clone)]
 pub enum BloopCommand {
     RefreshUi,
-    SetMidiOutput(flume::Sender<LiveEvent<'static>>),
 
     Midi(LiveEvent<'static>),
 
@@ -402,9 +400,9 @@ pub enum BloopCommand {
     StartPlaying(usize),
     ClearAll,
 }
-impl From<LiveEvent<'static>> for BloopCommand {
-    fn from(value: LiveEvent<'static>) -> Self {
-        BloopCommand::Midi(value)
+impl From<LiveEvent<'_>> for BloopCommand {
+    fn from(value: LiveEvent<'_>) -> Self {
+        BloopCommand::Midi(value.to_static())
     }
 }
 
@@ -422,20 +420,25 @@ pub struct BloopUiState {
     pub is_playback_active: bool,
 }
 
-pub fn spawn_bloops_thread(
-    commands_tx: flume::Sender<BloopCommand>,
-    commands_rx: flume::Receiver<BloopCommand>,
-) -> Result<flume::Receiver<UiState>> {
-    let mut midi_out_tx = None;
-    let (ui_state_tx, ui_state_rx) = flume::bounded(1);
+pub fn spawn_bloops_thread() -> Result<(
+    flume::Sender<BloopCommand>,
+    flume::Receiver<UiState>,
+    flume::Receiver<LiveEvent<'static>>,
+)> {
+    let (commands_tx, commands_rx) = flume::unbounded();
+    let (ui_state_tx, ui_state_rx) = flume::unbounded();
+    let (midi_out_tx, midi_out_rx) = flume::unbounded();
 
+    let commands_tx_ref = commands_tx.clone();
     std::thread::spawn(move || {
+        let commands_tx = commands_tx_ref;
+
         let mut epoch = None;
         let mut duration = None;
         let mut bloops = vec![
-            Bloop::new(0.into()),
-            Bloop::new(1.into()),
-            Bloop::new(2.into()),
+            Bloop::new(midi_out_tx.clone(), 0.into()),
+            Bloop::new(midi_out_tx.clone(), 1.into()),
+            Bloop::new(midi_out_tx.clone(), 2.into()),
         ];
 
         loop {
@@ -466,12 +469,6 @@ pub fn spawn_bloops_thread(
                     };
                     if ui_state_tx.send(ui_state).is_err() {
                         return;
-                    }
-                }
-                BloopCommand::SetMidiOutput(new_midi_out_tx) => {
-                    midi_out_tx = Some(new_midi_out_tx);
-                    for bloop in &mut bloops {
-                        bloop.midi_out_tx = midi_out_tx.clone();
                     }
                 }
 
@@ -565,7 +562,7 @@ pub fn spawn_bloops_thread(
         }
     });
 
-    Ok(ui_state_rx)
+    Ok((commands_tx, ui_state_rx, midi_out_rx))
 }
 
 fn next_loop_time(
