@@ -1,0 +1,12 @@
+global input
+- manages active bloops
+
+per bloop input
+
+retime
+
+per bloop output
+
+global output
+- parse cancel events
+- key tracker

@@ -1,0 +1,20 @@
+set_file_contents(name: &str, contents: &str)
+reload_changed_files()
+
+use_lib_file(lib)
+
+reload_files() -> Chunk
+
+import_lib()
+
+struct Lib<'lua> {
+    dependencies: Vec<String>, // filenames
+    dependents: Vec<String>, // filenames
+    exports: LuaTable<'lua>,
+    effects: Vec<Effect<'lua>>,
+}
+
+struct Effect<'lua> {
+    name: String,
+    init: LuaFunction<'lua>,
+}

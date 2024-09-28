@@ -1,0 +1,1 @@
+hashmap for key and CC values, then put key- or CC-specific hooks into that hashmap and look up there for events
