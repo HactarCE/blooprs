@@ -7,6 +7,7 @@ use eframe::egui;
 use eframe::emath::NumExt;
 use eyre::{eyre, Context, Result};
 use midi_io::AppMidiIO;
+use midly::num::u4;
 
 #[macro_use]
 mod generic_vec;
@@ -114,6 +115,52 @@ impl eframe::App for App {
             ui.group(|ui| self.midi_io.ui(ui));
 
             draw_time_display(ui, &state);
+
+            ui.input(|input| {
+                for ev in &input.events {
+                    if let egui::Event::Key {
+                        key,
+                        pressed,
+                        repeat: false,
+                        modifiers: _,
+                    } = ev
+                    {
+                        let key = match key {
+                            egui::Key::A => 57, // A
+                            egui::Key::W => 58, // A#
+                            egui::Key::R => 59, // B
+                            // egui::Key::F => todo!(),
+                            egui::Key::S => 60, // C
+                            egui::Key::P => 61, // C#
+                            egui::Key::T => 62, // D
+                            egui::Key::G => 63, // D#
+                            egui::Key::D => 64, // E
+                            // egui::Key::J => todo!(),
+                            egui::Key::H => 65, // F
+                            egui::Key::L => 66, // F#
+                            egui::Key::N => 67, // G
+                            egui::Key::U => 68, // G#
+                            egui::Key::E => 69, // A
+                            egui::Key::Y => 70, // A#
+                            egui::Key::I => 71, // B
+                            // egui::Key::Semicolon => (),
+                            egui::Key::O => 72, // C
+                            _ => continue,
+                        }
+                        .into();
+
+                        let vel = 95.into();
+
+                        self.send(BloopCommand::Midi(midly::live::LiveEvent::Midi {
+                            channel: 0.into(),
+                            message: match pressed {
+                                true => midly::MidiMessage::NoteOn { key, vel },
+                                false => midly::MidiMessage::NoteOff { key, vel },
+                            },
+                        }));
+                    }
+                }
+            });
 
             ui.horizontal(|ui| {
                 ui.allocate_space(egui::Vec2::new(0.0, 30.0));
