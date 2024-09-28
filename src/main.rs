@@ -173,38 +173,53 @@ impl eframe::App for App {
             });
             for (i, bloop) in state.bloops.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.label(format!("Bloop #{i}"));
+                    let (_, max_button_rect) = ui.allocate_space(egui::vec2(150.0, 1.0));
 
-                    let r = ui.selectable_label(bloop.is_listening, "Listen");
-                    if r.clicked() {
-                        self.send(BloopCommand::ToggleListening(i));
-                    }
+                    ui.vertical(|ui| {
+                        ui.group(|ui| {
+                            ui.strong(format!("Bloop #{i}"));
+                            ui.horizontal(|ui| {
+                                let r = ui.selectable_label(bloop.is_listening, "Listen");
+                                if r.clicked() {
+                                    self.send(BloopCommand::ToggleListening(i));
+                                }
 
-                    let r = ui.selectable_label(bloop.is_playback_active, "Playback");
-                    if r.clicked() {
-                        self.send(BloopCommand::TogglePlayback(i));
-                    }
+                                let r = ui.selectable_label(bloop.is_playback_active, "Playback");
+                                if r.clicked() {
+                                    self.send(BloopCommand::TogglePlayback(i));
+                                }
+                            });
 
-                    if bloop.is_waiting_to_record {
-                        ui.label("Waiting until start of loop ...");
-                    } else if bloop.is_recording {
-                        ui.label("Recording ...");
-                        if state.duration.is_none() {
-                            if ui.button("Stop recording").clicked() {
-                                self.send(BloopCommand::StartPlaying(i));
+                            let button = |ui: &mut egui::Ui, label| {
+                                let x_range = max_button_rect.x_range().shrink(10.0);
+                                let y_range = ui.min_rect().y_range().shrink(10.0);
+                                let rect = egui::Rect::from_x_y_ranges(x_range, y_range);
+                                ui.put(rect, egui::Button::new(label))
+                            };
+
+                            if bloop.is_waiting_to_record {
+                                ui.label("Waiting until start of loop ...");
+                                ui.add_visible_ui(false, |ui| button(ui, ""));
+                            } else if bloop.is_recording {
+                                ui.label("Recording ...");
+                                if state.duration.is_none() {
+                                    if button(ui, "Stop recording").clicked() {
+                                        self.send(BloopCommand::StartPlaying(i));
+                                    }
+                                }
+                            } else if bloop.is_playing_back {
+                                ui.label("Playing");
+                                if button(ui, "Cancel playback").clicked() {
+                                    self.send(BloopCommand::CancelPlaying(i));
+                                }
+                            } else {
+                                ui.label("Idle");
+                                if button(ui, "Record").clicked() {
+                                    self.send(BloopCommand::StartRecording(i));
+                                }
                             }
-                        }
-                    } else if bloop.is_playing_back {
-                        ui.label("Playing");
-                        if ui.button("Cancel playback").clicked() {
-                            self.send(BloopCommand::CancelPlaying(i));
-                        }
-                    } else {
-                        ui.label("Idle");
-                        if ui.button("Record").clicked() {
-                            self.send(BloopCommand::StartRecording(i));
-                        }
-                    }
+                        });
+                    })
                 });
             }
 
