@@ -7,7 +7,6 @@ use eframe::egui;
 use eframe::emath::NumExt;
 use eyre::{eyre, Context, Result};
 use midi_io::AppMidiIO;
-use midly::num::u4;
 
 #[macro_use]
 mod generic_vec;
@@ -42,7 +41,7 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Bloop.rs",
         native_options,
-        Box::new(|cc| Box::new(App::new(cc).unwrap())),
+        Box::new(|cc| Ok(Box::new(App::new(cc).unwrap()))),
     )
     .map_err(|e| eyre!("{e}"))
 }
@@ -119,32 +118,32 @@ impl eframe::App for App {
             ui.input(|input| {
                 for ev in &input.events {
                     if let egui::Event::Key {
-                        key,
+                        physical_key: Some(k),
                         pressed,
                         repeat: false,
-                        modifiers: _,
+                        ..
                     } = ev
                     {
-                        let key = match key {
+                        let key = match k {
                             egui::Key::A => 57, // A
                             egui::Key::W => 58, // A#
-                            egui::Key::R => 59, // B
-                            // egui::Key::F => todo!(),
-                            egui::Key::S => 60, // C
-                            egui::Key::P => 61, // C#
-                            egui::Key::T => 62, // D
-                            egui::Key::G => 63, // D#
-                            egui::Key::D => 64, // E
-                            // egui::Key::J => todo!(),
+                            egui::Key::S => 59, // B
+                            // egui::Key::E => (),
+                            egui::Key::D => 60, // C
+                            egui::Key::R => 61, // C#
+                            egui::Key::F => 62, // D
+                            egui::Key::T => 63, // D#
+                            egui::Key::G => 64, // E
+                            // egui::Key::Y => (),
                             egui::Key::H => 65, // F
-                            egui::Key::L => 66, // F#
-                            egui::Key::N => 67, // G
-                            egui::Key::U => 68, // G#
-                            egui::Key::E => 69, // A
-                            egui::Key::Y => 70, // A#
-                            egui::Key::I => 71, // B
-                            // egui::Key::Semicolon => (),
-                            egui::Key::O => 72, // C
+                            egui::Key::U => 66, // F#
+                            egui::Key::J => 67, // G
+                            egui::Key::I => 68, // G#
+                            egui::Key::K => 69, // A
+                            egui::Key::O => 70, // A#
+                            egui::Key::L => 71, // B
+                            // egui::Key::P => (),
+                            egui::Key::Semicolon => 72, // C
                             _ => continue,
                         }
                         .into();
@@ -199,7 +198,9 @@ impl eframe::App for App {
 
                             if bloop.is_waiting_to_record {
                                 ui.label("Waiting until start of loop ...");
-                                ui.add_visible_ui(false, |ui| button(ui, ""));
+                                ui.scope_builder(egui::UiBuilder::new().invisible(), |ui| {
+                                    button(ui, "")
+                                });
                             } else if bloop.is_recording {
                                 ui.label("Recording ...");
                                 if state.duration.is_none() {
@@ -296,7 +297,7 @@ fn draw_time_display(ui: &mut egui::Ui, state: &UiState) {
                 j as f32 * beat_width + measure_x,
                 0.75,
                 egui::Color32::DARK_GRAY,
-            )
+            );
         }
     }
     vline(&painter, 1.0, 1.0, egui::Color32::GRAY);
